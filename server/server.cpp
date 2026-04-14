@@ -134,7 +134,9 @@ struct ITCHCursor {
 
     ITCHCursor(const uint8_t* data, size_t size) : base(data), file_size(size) {}
 
-    bool has_next() const { return offset + 2 <= file_size; }
+    bool has_next() const { 
+        return offset + 2 <= file_size; 
+    }
 
     const uint8_t* next(uint16_t& msg_len) {
         // Length

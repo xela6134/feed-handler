@@ -23,14 +23,14 @@ All integers are **big-endian unsigned**. Timestamps are **6-byte nanoseconds si
 
 ## Stock Locate
 
-Every message contains a `stock_locate` field (2-byte integer) instead of the full symbol. The mapping from `stock_locate` → symbol is established at the start of the day via Stock Directory (`R`) messages. This saves 6 bytes per message across hundreds of millions of messages.
+Every message contains a `stock_locate` field (2-byte integer) instead of the full symbol. The mapping from `stock_locate` -> symbol is established at the start of the day via Stock Directory (`R`) messages. This saves 6 bytes per message across hundreds of millions of messages.
 
 ### Message Types (Book-Affecting)
 
 | Type | Name | Size | Description |
 |------|------|------|-------------|
 | `S` | System Event | 12 | Market open/close signals |
-| `R` | Stock Directory | 39 | Establishes `stock_locate` → symbol mapping |
+| `R` | Stock Directory | 39 | Establishes `stock_locate` -> symbol mapping |
 | `A` | Add Order | 36 | New order on the book (no attribution) |
 | `F` | Add Order MPID | 40 | New order with market participant ID |
 | `E` | Order Executed | 31 | Partial/full fill at original price |
