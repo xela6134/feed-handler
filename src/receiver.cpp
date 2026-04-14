@@ -23,7 +23,7 @@ void receiver_main(SPSCQueue* queue) {
 
         // Push entire UDP payload (MoldUDP64 packet) into the queue
         if (!queue->try_push(recv_buf, static_cast<uint16_t>(n))) {
-            // Queue full — book handler can't keep up
+            // Queue full, book handler can't keep up
             // Log this, it means you're dropping data
         }
     }

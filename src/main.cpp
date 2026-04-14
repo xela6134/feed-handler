@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <sys/mman.h>
 
+// Separate cores for SPSC
 void pin_to_core(int core) {
     cpu_set_t set;
     CPU_ZERO(&set);
