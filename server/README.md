@@ -1,70 +1,128 @@
-# Test Files
+# MoldUDP64 Sender
 
 ## Official Document
 
 - More information can be found on the link below.
-- **Link**: https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification.pdf
+- **Link**: https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/moldudp64.pdf
 
 ## Overview
 
-ITCH 5.0 is NASDAQ's binary market data feed protocol. It delivers a stream of messages describing every order added, modified, and executed on the exchange. It is a **read-only outbound feed**, meaning you receive it to reconstruct the order book, you don't send orders through it (that's OUCH).
+MoldUDP64 is a thin framing layer on top of regular UDP, designed by NASDAQ for delivering market data feeds. The underlying transport is still plain UDP — same sockets, same unreliable delivery. MoldUDP64 adds three things that raw UDP lacks: **sequencing** (detect lost packets), **message batching** (pack multiple ITCH messages into one UDP datagram), and **session management** (heartbeats and end-of-session signals).
 
-## Wire Format
+MoldUDP64 does NOT add reliability. If a packet is lost, it's lost. It gives you the tools to *detect* the loss via sequence number gaps, and optionally request retransmission via a separate channel.
 
-Each message is prefixed with a **2-byte big-endian length**, followed by the message body. Messages are packed back-to-back with no delimiters.
+## Packet Format
+
+Every MoldUDP64 packet starts with a fixed 20-byte header, followed by zero or more message blocks packed back-to-back.
 
 ```
-[2-byte length][message body][2-byte length][message body]...
+┌──────────────────────────────────────────────────────────┐
+│ Session          (10 bytes, ASCII, right-padded spaces)  │
+│ Sequence Number  (8 bytes, big-endian uint64)            │
+│ Message Count    (2 bytes, big-endian uint16)            │
+├──────────────────────────────────────────────────────────┤
+│ Message Block 1: [2-byte BE length][message data]        │
+│ Message Block 2: [2-byte BE length][message data]        │
+│ ...                                                      │
+└──────────────────────────────────────────────────────────┘
 ```
 
-All integers are **big-endian unsigned**. Timestamps are **6-byte nanoseconds since midnight**. Stock symbols are **8 bytes, right-padded with spaces**. Prices use **4 implied decimal places** (e.g. `1501234` = `$150.1234`).
+### Header Fields
 
-## Stock Locate
+| Offset | Length | Field | Description |
+|--------|--------|-------|-------------|
+| 0 | 10 | Session | Identifies the logical stream. Assigned per trading day. |
+| 10 | 8 | Sequence Number | Sequence number of the **first** message in this packet. |
+| 18 | 2 | Message Count | Number of message blocks. `0` = heartbeat, `0xFFFF` = end of session. |
 
-Every message contains a `stock_locate` field (2-byte integer) instead of the full symbol. The mapping from `stock_locate` → symbol is established at the start of the day via Stock Directory (`R`) messages. This saves 6 bytes per message across hundreds of millions of messages.
+### Message Blocks
 
-### Message Types (Book-Affecting)
+Each block is a 2-byte big-endian length followed by the message body (an ITCH message). Blocks start immediately after the header at byte 20, and subsequent blocks follow with no gaps.
 
-| Type | Name | Size | Description |
-|------|------|------|-------------|
-| `S` | System Event | 12 | Market open/close signals |
-| `R` | Stock Directory | 39 | Establishes `stock_locate` → symbol mapping |
-| `A` | Add Order | 36 | New order on the book (no attribution) |
-| `F` | Add Order MPID | 40 | New order with market participant ID |
-| `E` | Order Executed | 31 | Partial/full fill at original price |
-| `C` | Order Executed w/ Price | 36 | Fill at a different price (price improvement) |
-| `X` | Order Cancel | 23 | Partial cancellation (reduce shares) |
-| `D` | Order Delete | 19 | Full cancellation (remove order) |
-| `U` | Order Replace | 35 | Cancel-replace: deletes old order, creates new one with new ref/price/size |
+### Special Packets
 
-### Key Design Notes
+- **Heartbeat**: Message count = `0`, no message blocks. Sent periodically so receivers can detect link failures. Contains the next expected sequence number.
+- **End of Session**: Message count = `0xFFFF`. Signals that no more messages will be sent on this session.
 
-- **`E`/`C`/`X`/`D`/`U` messages do NOT carry the stock symbol or side.** You must look these up from the original `A`/`F` add message via the order reference number.
-- **`U` (Replace)** assigns a new order reference number. The old ref is dead; all subsequent messages use the new ref. Side, symbol, and MPID carry over from the original add.
-- **`X` (Cancel) vs `D` (Delete):** Cancel is partial (reduce by N shares), Delete is full (remove entirely).
-- **`P`/`Q`/`B` (Trade messages)** exist in the protocol but do NOT affect the displayable book and can be skipped for book reconstruction.
+## Sequencing
 
-### Test File: `test_itch.bin`
+The sequence number in each packet refers to the first message it contains. Subsequent messages are implicitly numbered. For example:
 
-Generated by `generate_itch.py`. Contains 10 symbols, 50 seed orders, and 1000 live updates covering all book-affecting message types. Run the generator to regenerate or adjust parameters.
+```
+Packet 1:  seq=1,   count=20  →  messages 1-20
+Packet 2:  seq=21,  count=15  →  messages 21-35
+Packet 3:  seq=36,  count=8   →  messages 36-43
+```
+
+If the receiver gets packet 1 (seq=1, count=20) then packet 3 (seq=36), it knows packet 2 was lost because it expected seq=21 but got seq=36. Without this, a lost UDP packet would silently corrupt the order book.
+
+## Why Batching?
+
+Each UDP datagram has 28 bytes of IP+UDP header overhead. ITCH messages are small (19-40 bytes each). Sending each message as a separate UDP packet would mean the headers are larger than the payload. Batching 20 messages into one packet reduces overhead by 20x and reduces system call count (one `sendto` instead of twenty).
+
+## Example Packet
+
+Three ITCH messages in one packet (System Event + Add Order + Order Executed), starting at sequence number 47:
+
+```
+Offset    Raw Bytes                          Field
+───────   ──────────────────────────────     ─────────────────────────
+          ┌─── Header (20 bytes) ──────────────────────────────────┐
+0-9       54 45 53 54 30 30 30 30 30 31      Session = "TEST000001"
+10-17     00 00 00 00 00 00 00 2F            Sequence Number = 47
+18-19     00 03                              Message Count = 3
+          └────────────────────────────────────────────────────────┘
+
+          ┌─── Message Block 1 ────────────┐
+20-21     00 0C                              Length = 12
+22-33     53 00 00 00 01 ...                 ITCH System Event (12 bytes)
+          └────────────────────────────────┘
+
+          ┌─── Message Block 2 ────────────┐
+34-35     00 24                              Length = 36
+36-71     41 00 01 00 0B ...                 ITCH Add Order (36 bytes)
+          └────────────────────────────────┘
+
+          ┌─── Message Block 3 ────────────┐
+72-73     00 1F                              Length = 31
+74-104    45 00 01 00 0C ...                 ITCH Order Executed (31 bytes)
+          └────────────────────────────────┘
+
+Total UDP payload: 20 + (2+12) + (2+36) + (2+31) = 105 bytes
+```
+
+## Sender
+
+The sender reads an ITCH binary file via `mmap` (zero-copy), wraps messages in MoldUDP64 packets, and sends them over UDP to `127.0.0.1:12345`.
+
+### Build
 
 ```bash
-python3 generate_itch.py
+g++ -O3 -std=c++20 -Wall -o sender sender.cpp
 ```
 
-### Example ITCH Message
+### Usage
 
+```bash
+./sender <itch_file> burst                # Send as fast as possible
+./sender <itch_file> throttled [rate]     # Send at rate msg/sec (default: 100000)
+./sender <itch_file> realtime [speed]     # Replay at original timestamps (default: 1000x)
 ```
-Offset  Length  Field                    Value              Raw Bytes
-──────  ──────  ─────────────────────    ───────────────    ──────────────────
-                [2-byte length prefix]   36                 00 24
-0       1       Message Type             'A'                41
-1       2       Stock Locate             1                  00 01
-3       2       Tracking Number          11                 00 0B
-5       6       Timestamp (ns)           34200000001753     00 1F 1A B1 0C D9
-11      8       Order Reference Number   1001               00 00 00 00 00 00 03 E9
-19      1       Buy/Sell Indicator        'B'               42
-20      4       Shares                   100                00 00 00 64
-24      8       Stock                    "AAPL    "         41 41 50 4C 20 20 20 20
-32      4       Price                    1849000            00 1C 33 28
-```
+
+### Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `burst` | No pacing, sends everything immediately | Stress testing, throughput benchmarking |
+| `throttled` | Fixed rate with configurable msg/sec | Controlled latency measurement |
+| `realtime` | Sleeps based on ITCH timestamp deltas, with speed multiplier | Simulating a real trading day |
+
+### Defaults
+
+| Parameter | Value |
+|-----------|-------|
+| Host | `127.0.0.1` |
+| Port | `12345` |
+| Max batch | 20 messages per packet |
+| Max packet | 1400 bytes (conservative, below 1500 Ethernet MTU) |
+| Session ID | `TEST000001` |
